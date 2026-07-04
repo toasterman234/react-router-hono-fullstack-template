@@ -51,7 +51,9 @@ app.post("/api/compose", async (c) => {
 
 app.get("/api/tasks", async (c) => c.json({ tasks: await fetchGithubTasks(c.env) }));
 
-app.get("*", (c) => {
+// `all`, not `get`: React Router route actions (e.g. the /tasks compose
+// form) POST back to the page itself, not to a /api/* route.
+app.all("*", (c) => {
 	const requestHandler = createRequestHandler(
 		() => import("virtual:react-router/server-build"),
 		import.meta.env.MODE,
