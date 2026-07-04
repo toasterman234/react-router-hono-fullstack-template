@@ -10,7 +10,7 @@
 	"vars": {
 		"AGENT_MAIL_URL": "https://agentmail.goobnut.com",
 		"GITHUB_REPOS": "toasterman234/life-os",
-		"AGENT_MAIL_PROJECTS": "/Users/bencharney/ben-agents3,/Users/bencharney/ben-agents3/projects/personal/life-os-knowledge-graph/life-os,/Users/bencharney/central-ops-dashboard,/Users/bencharney/mac-process-monitor,/Users/bencharney/personal-ops,/Users/bencharney/sandbox/ax-plane-cockpit"
+		"AGENT_MAIL_PROJECTS": "users-bencharney-ben-agents3,users-bencharney-ben-agents3-projects-personal-life-os-knowledge-graph-life-os,users-bencharney-central-ops-dashboard,users-bencharney-mac-process-monitor,users-bencharney-personal-ops,users-bencharney-sandbox-ax-plane-cockpit"
 	},
 	"observability": {
 		"enabled": true
