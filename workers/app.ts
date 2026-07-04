@@ -13,19 +13,25 @@ type Env = {
 
 const app = new Hono<{ Bindings: Env }>();
 
+// The whole agentmail.goobnut.com hostname sits behind Cloudflare Access, so
+// every call — REST or MCP — needs the service-token headers, not just the
+// app's own bearer token.
+function agentMailHeaders(env: Env, extra?: Record<string, string>) {
+	return {
+		"CF-Access-Client-Id": env.CF_ACCESS_CLIENT_ID,
+		"CF-Access-Client-Secret": env.CF_ACCESS_CLIENT_SECRET,
+		Authorization: `Bearer ${env.AGENT_MAIL_TOKEN}`,
+		...extra,
+	};
+}
+
 // mcp-agent-mail's REST surface only covers 3 read endpoints (unified-inbox,
 // projects/{project}/agents, sibling-suggestion). Search and send only exist
-// via its MCP JSON-RPC interface at /mcp/ — same auth as the REST calls
-// (CF Access service-token headers + the app's own bearer token).
+// via its MCP JSON-RPC interface at /mcp/.
 async function callAgentMailTool(env: Env, name: string, args: Record<string, unknown>) {
 	const res = await fetch(`${env.AGENT_MAIL_URL}/mcp/`, {
 		method: "POST",
-		headers: {
-			"content-type": "application/json",
-			"CF-Access-Client-Id": env.CF_ACCESS_CLIENT_ID,
-			"CF-Access-Client-Secret": env.CF_ACCESS_CLIENT_SECRET,
-			Authorization: `Bearer ${env.AGENT_MAIL_TOKEN}`,
-		},
+		headers: agentMailHeaders(env, { "content-type": "application/json" }),
 		body: JSON.stringify({
 			jsonrpc: "2.0",
 			id: crypto.randomUUID(),
@@ -58,7 +64,7 @@ async function callAgentMailTool(env: Env, name: string, args: Record<string, un
 
 app.get("/api/inbox", async (c) => {
 	const res = await fetch(`${c.env.AGENT_MAIL_URL}/mail/api/unified-inbox`, {
-		headers: { Authorization: `Bearer ${c.env.AGENT_MAIL_TOKEN}` },
+		headers: agentMailHeaders(c.env),
 	});
 	const body = await res.text();
 	return c.newResponse(body, res.status as any, {
@@ -70,7 +76,7 @@ app.get("/api/projects/:project/agents", async (c) => {
 	const project = c.req.param("project");
 	const res = await fetch(
 		`${c.env.AGENT_MAIL_URL}/mail/api/projects/${project}/agents`,
-		{ headers: { Authorization: `Bearer ${c.env.AGENT_MAIL_TOKEN}` } },
+		{ headers: agentMailHeaders(c.env) },
 	);
 	const body = await res.text();
 	return c.newResponse(body, res.status as any, {
