@@ -205,34 +205,59 @@ of only reading it through the Worker's thin REST proxy.
 ## 2. This Worker app
 
 ### Routes (`app/routes.ts`)
-- `/` → `app/routes/inbox.tsx` — unified inbox across all mail-mail projects
-- `/tasks` → `app/routes/tasks.tsx` — open GitHub issues as a task list
+- `/` → `app/routes/inbox.tsx` — standalone unified inbox (older, simpler page)
+- `/tasks` → `app/routes/tasks.tsx` — the main dashboard: GitHub issues, mail
+  inbox, per-project agent directory, search, and compose, all on one page
+
+### Server helpers (`app/lib/agent-mail.server.ts`)
+All mcp-agent-mail/GitHub calls live here as plain functions
+(`fetchInbox`, `fetchProjectAgents`, `listMailProjects`, `searchMessages`,
+`sendMessage`, `fetchGithubTasks`, `callAgentMailTool`). Route loaders/
+actions call these **directly** via `context.cloudflare.env` — they do not
+fetch this Worker's own `/api/*` routes. (A same-worker subrequest to this
+Worker's own `workers.dev` URL does not loop back through Hono's router; it
+404s. Found and fixed 2026-07-04.)
+
+Every call to `agentmail.goobnut.com` needs **three** headers:
+`CF-Access-Client-Id`, `CF-Access-Client-Secret` (Cloudflare Access gates
+the whole hostname), and `Authorization: Bearer <AGENT_MAIL_TOKEN>` (the
+origin's own auth — it does **not** run `--no-auth`, correcting an earlier
+version of this doc). See `agentMailHeaders()` in that file.
+
+`mcp-agent-mail`'s REST surface only covers 3 read endpoints
+(`unified-inbox`, `projects/{project}/agents`, a sibling-suggestion POST).
+Search and send only exist via its **MCP JSON-RPC interface** at
+`${AGENT_MAIL_URL}/mcp/` (`tools/call` envelope) — see `callAgentMailTool`.
 
 ### Backend API (`workers/app.ts`, Hono)
-- `GET /api/inbox` — proxies `${AGENT_MAIL_URL}/mail/api/unified-inbox` with
-  the bearer token attached server-side (token never reaches the client).
-  Note: this token is sent to the *origin*, which now runs `--no-auth` (see
-  §1) so the origin ignores it — harmless to keep sending, but it is no
-  longer doing any gating. The Worker's own secret rotation story (below)
-  is unaffected either way.
-- `GET /api/projects/:project/agents` — proxies
-  `${AGENT_MAIL_URL}/mail/api/projects/{project}/agents` (defined, not yet
-  used by any page — available for a future per-project view)
-- `GET /api/tasks` — fetches open issues (non-PR) from each repo listed in
-  `GITHUB_REPOS`, directly against `api.github.com` using `GITHUB_TOKEN`
-- `GET *` — falls through to React Router SSR (the original template behavior)
+Thin wrappers around the same helpers above, kept for external
+consumers/debugging via curl — the app's own pages don't call these:
+- `GET /api/inbox`, `GET /api/projects/:project/agents`, `GET /api/tasks`,
+  `GET /api/mail-projects`, `GET /api/search?project=&query=`,
+  `POST /api/compose`
+- `ALL *` — falls through to React Router SSR. Must be `app.all`, not
+  `app.get` — React Router route `action`s (the compose form) `POST` back
+  to the page itself, and `app.get("*", ...)` silently 404'd those.
 
 ### Config (`wrangler.jsonc`)
 - `vars.AGENT_MAIL_URL` = `https://agentmail.goobnut.com`
-- `vars.GITHUB_REPOS` = `toasterman234/react-router-hono-fullstack-template`
-  (comma-separated if you want to track more repos — **this is almost
-  certainly the first thing to change**, since right now it only tracks its
-  own repo, which has no open issues)
+- `vars.GITHUB_REPOS` = `toasterman234/life-os`
+  (comma-separated for more repos)
+- `vars.AGENT_MAIL_PROJECTS` = comma-separated project **slugs** (e.g.
+  `users-bencharney-ben-agents3`) used to populate the agent-directory and
+  search/compose dropdowns. Must be slugs, not the raw absolute path used
+  with `ensure_project` — the REST agents-list endpoint 500s on a path
+  with slashes in it.
 
 ### Secrets (set via `wrangler secret put`, not in any file)
 - `AGENT_MAIL_TOKEN` — same bearer token as the VPS's `agent-mail.service`
-  unit file. No longer enforced by the origin (`--no-auth`, see §1) but the
-  Worker still sends it; leave as-is unless you also revert `--no-auth`.
+  unit file. Required (see above — the origin does enforce it).
+- `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET` — the same Cloudflare
+  Access service-token credentials Ben's Mac coding harnesses already use
+  (`~/.config/agent-mail-mcp/agent-mail-mcp.env` on the Mac). Added
+  2026-07-04 — the Worker couldn't reach `agentmail.goobnut.com` at all
+  without these; every call was silently redirected to the Access login
+  page instead of hitting the app.
 - `GITHUB_TOKEN` — a **separate**, narrowly-scoped GitHub fine-grained PAT
   (Issues: Read-only). This is intentionally NOT the same credential as the
   VPS executor's GitHub connection — different trust boundary, different
@@ -257,21 +282,8 @@ scoped tokens can't make.
 
 ## 3. What's NOT built yet (real gaps, not oversights)
 
-`mcp-agent-mail`'s Rust HTTP server only exposes **three** JSON endpoints
-under `/mail/api/`: `unified-inbox`, `projects/{project}/agents`, and a
-sibling-suggestion POST. Everything else — sending a message, creating/
-listing file reservations (advisory locks), reading a specific thread — only
-exists through the **MCP JSON-RPC interface** (`POST /api/` on the mail-mail
-server, tool-call protocol), not plain REST. This means:
-
-- **No compose/send UI in this Worker** — would require the Worker to speak
-  MCP JSON-RPC (a `tools/call` request body) to mail-mail, not just
-  `fetch()` a REST path. (The upstream `/mail` web UI, now reachable
-  directly at https://agentmail.goobnut.com/mail via Cloudflare Access, DOES
-  have compose/search/reservations built in — see §1 — so this gap only
-  applies to the custom Worker pages, not to the mailbox as a whole.)
-- **No file-reservation view in this Worker** — same limitation; the
-  upstream `/mail` UI has one, this Worker doesn't.
+- **No file-reservation view in this Worker** — the upstream `/mail` UI
+  has one (advisory file locks between agents), this Worker doesn't.
 - **`/mail/api/locks`** exists but is **not** the file-reservation concept —
   it returns raw OS-level lock *files* (SQLite/search-index locks), which is
   a different, lower-level thing. Don't wire this up thinking it's the
@@ -280,26 +292,28 @@ server, tool-call protocol), not plain REST. This means:
   each page load (React Router loaders), no polling/websockets. The upstream
   Rust project's own docs mark a live browser dashboard as explicitly
   deferred/unsupported, so there's no existing reference to build against.
-- **No coding harness actually uses the mailbox day-to-day yet** — the one
-  agent/message in it (§1) is a smoke test, not real multi-agent
-  coordination. Nothing runs `am setup run` locally yet to wire Claude
-  Code / Codex / opencode to register and send through it automatically.
+- **No coding harness actually uses the mailbox day-to-day yet** — the
+  registered agents/messages are richer smoke tests now (compose/search
+  verified end-to-end against the raw database) but still not real
+  multi-agent coordination. Nothing runs `am setup run` locally yet to wire
+  Claude Code / Codex / opencode to register and send through it
+  automatically.
+- **mcp-agent-mail's MCP JSON-RPC interface has a staleness bug** — after
+  heavy activity, it can stop seeing agents/messages that the REST API and
+  raw database both confirm exist (send/search silently no-op instead of
+  erroring). Fixed by restarting `agent-mail.service`; see `HANDOFF.md` for
+  how to recognize and verify it if it recurs.
 
 ## 4. Natural next steps
 
 1. **Wire real harnesses in**: run `am setup run` on Ben's Mac Mini (and any
    other machine running coding agents) to auto-detect installed agents and
    write their MCP config so they register/send/reserve through this
-   mailbox for real, instead of the one-off smoke-test agent in §1.
-2. Point `GITHUB_REPOS` at whatever repos actually have Ben's real task
-   backlog (right now it's a placeholder pointing at itself).
-3. Decide the Worker's fate now that the upstream `/mail` UI is directly
-   browsable: either point/redirect this Worker's pages at
-   `https://agentmail.goobnut.com/mail` instead of maintaining a parallel
-   thinner UI, or keep this Worker strictly for the `/tasks` (GitHub) view
-   and drop the inbox-duplication attempt.
-4. If compose/reservations are still wanted *inside this Worker* (rather
-   than sending people to the upstream `/mail` UI): implement a small MCP
-   JSON-RPC client in `workers/app.ts` (`POST` to `${AGENT_MAIL_URL}/api/`
-   with a `tools/call` envelope) rather than expecting a REST shortcut —
-   there isn't one.
+   mailbox for real, instead of smoke-test agents.
+2. Compose only sends plain messages — no thread replies, ack-required,
+   CC/BCC, or file reservations. Extend `app/lib/agent-mail.server.ts` with
+   more `callAgentMailTool` wrappers if those are wanted inside this Worker
+   (vs. sending people to the upstream `/mail` UI, which already has them).
+3. Consider a health-check ping against `agentmail.goobnut.com`'s MCP
+   interface (not just REST) to catch the staleness bug in §3 before a
+   human notices silently-missing sends.
