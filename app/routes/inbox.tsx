@@ -1,31 +1,13 @@
 import { Nav } from "../components/nav";
+import { fetchInbox } from "../lib/agent-mail.server";
 import type { Route } from "./+types/inbox";
-
-type UnifiedMessage = {
-	id: number;
-	subject: string;
-	excerpt: string;
-	importance: string;
-	sender: string;
-	recipients: string;
-	project_slug: string;
-	project_name: string;
-	created_relative: string;
-	read: boolean;
-};
 
 export function meta() {
 	return [{ title: "Agent Inbox" }];
 }
 
-export async function loader({ request }: Route.LoaderArgs) {
-	const url = new URL("/api/inbox", request.url);
-	const res = await fetch(url.toString());
-	if (!res.ok) {
-		return { messages: [] as UnifiedMessage[], error: `inbox fetch failed: ${res.status}` };
-	}
-	const data = (await res.json()) as { messages: UnifiedMessage[] };
-	return { messages: data.messages ?? [], error: null as string | null };
+export async function loader({ context }: Route.LoaderArgs) {
+	return fetchInbox(context.cloudflare.env);
 }
 
 const importanceClass: Record<string, string> = {

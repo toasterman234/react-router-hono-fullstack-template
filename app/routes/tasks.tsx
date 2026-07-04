@@ -1,112 +1,53 @@
 import { Form, useNavigation } from "react-router";
 import { Nav } from "../components/nav";
+import {
+	fetchGithubTasks,
+	fetchInbox,
+	fetchProjectAgents,
+	listMailProjects,
+	searchMessages,
+	sendMessage,
+} from "../lib/agent-mail.server";
 import type { Route } from "./+types/tasks";
-
-type Task = {
-	repo: string;
-	number: number;
-	title: string;
-	url: string;
-	state: string;
-	labels: string[];
-	created_at: string;
-	updated_at: string;
-};
-
-type UnifiedMessage = {
-	id: number;
-	subject: string;
-	excerpt: string;
-	importance: string;
-	sender: string;
-	recipients: string;
-	project_slug: string;
-	project_name: string;
-	created_relative: string;
-	read: boolean;
-};
-
-type MailAgent = {
-	name: string;
-	program: string;
-	model: string;
-	task_description: string;
-};
-
-type ProjectAgents = { project: string; agents: MailAgent[]; error: string | null };
-
-type SearchResult = {
-	id: number;
-	subject: string;
-	importance: string;
-	created_ts: string;
-	from: string;
-};
 
 export function meta() {
 	return [{ title: "Agent Dashboard" }];
 }
 
-export async function loader({ request }: Route.LoaderArgs) {
+export async function loader({ request, context }: Route.LoaderArgs) {
+	const env = context.cloudflare.env;
 	const requestUrl = new URL(request.url);
 
-	const tasksRes = await fetch(new URL("/api/tasks", request.url).toString());
-	const tasksData = tasksRes.ok
-		? ((await tasksRes.json()) as { tasks: Task[] })
-		: { tasks: [] as Task[] };
+	const [tasks, inbox, projects] = await Promise.all([
+		fetchGithubTasks(env),
+		fetchInbox(env),
+		Promise.resolve(listMailProjects(env)),
+	]);
 
-	const inboxRes = await fetch(new URL("/api/inbox", request.url).toString());
-	const inboxData = inboxRes.ok
-		? ((await inboxRes.json()) as { messages: UnifiedMessage[] })
-		: { messages: [] as UnifiedMessage[] };
-
-	const projectsRes = await fetch(new URL("/api/mail-projects", request.url).toString());
-	const projectsData = projectsRes.ok
-		? ((await projectsRes.json()) as { projects: string[] })
-		: { projects: [] as string[] };
-
-	const projectAgents: ProjectAgents[] = await Promise.all(
-		projectsData.projects.map(async (project) => {
-			const res = await fetch(
-				new URL(`/api/projects/${encodeURIComponent(project)}/agents`, request.url).toString(),
-			);
-			if (!res.ok) {
-				return { project, agents: [], error: `fetch failed: ${res.status}` };
-			}
-			const data = (await res.json()) as { agents?: MailAgent[] };
-			return { project, agents: data.agents ?? [], error: null };
-		}),
+	const projectAgents = await Promise.all(
+		projects.map(async (project) => ({ project, ...(await fetchProjectAgents(env, project)) })),
 	);
 
 	const searchProject = requestUrl.searchParams.get("search_project");
 	const searchQuery = requestUrl.searchParams.get("search_query");
-	let searchResults: SearchResult[] = [];
-	let searchError: string | null = null;
-	if (searchProject && searchQuery) {
-		const searchRes = await fetch(
-			new URL(
-				`/api/search?project=${encodeURIComponent(searchProject)}&query=${encodeURIComponent(searchQuery)}`,
-				request.url,
-			).toString(),
-		);
-		const data = (await searchRes.json()) as { result?: SearchResult[]; error?: string };
-		searchResults = data.result ?? [];
-		searchError = data.error ?? null;
-	}
+	const search =
+		searchProject && searchQuery
+			? await searchMessages(env, searchProject, searchQuery)
+			: { result: [], error: null };
 
 	return {
-		tasks: tasksData.tasks ?? [],
-		messages: inboxData.messages ?? [],
-		projects: projectsData.projects,
+		tasks,
+		messages: inbox.messages,
+		projects,
 		projectAgents,
 		searchProject: searchProject ?? "",
 		searchQuery: searchQuery ?? "",
-		searchResults,
-		searchError,
+		searchResults: search.result,
+		searchError: search.error,
 	};
 }
 
-export async function action({ request }: Route.ActionArgs) {
+export async function action({ request, context }: Route.ActionArgs) {
 	const form = await request.formData();
 	const project = String(form.get("project") ?? "");
 	const sender = String(form.get("sender") ?? "");
@@ -117,13 +58,8 @@ export async function action({ request }: Route.ActionArgs) {
 	const subject = String(form.get("subject") ?? "");
 	const body_md = String(form.get("body_md") ?? "");
 
-	const res = await fetch(new URL("/api/compose", request.url).toString(), {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ project, sender, to, subject, body_md }),
-	});
-	const data = (await res.json()) as { ok?: boolean; error?: string };
-	return { composeOk: Boolean(data.ok), composeError: data.error ?? null };
+	const result = await sendMessage(context.cloudflare.env, { project, sender, to, subject, body_md });
+	return { composeOk: result.ok, composeError: result.error };
 }
 
 const importanceClass: Record<string, string> = {

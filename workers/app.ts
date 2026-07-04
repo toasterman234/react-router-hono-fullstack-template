@@ -1,95 +1,28 @@
 import { Hono } from "hono";
 import { createRequestHandler } from "react-router";
-
-type Env = {
-	AGENT_MAIL_URL: string;
-	AGENT_MAIL_TOKEN: string;
-	CF_ACCESS_CLIENT_ID: string;
-	CF_ACCESS_CLIENT_SECRET: string;
-	AGENT_MAIL_PROJECTS: string;
-	GITHUB_TOKEN: string;
-	GITHUB_REPOS: string;
-};
+import {
+	fetchGithubTasks,
+	fetchInbox,
+	fetchProjectAgents,
+	listMailProjects,
+	searchMessages,
+	sendMessage,
+} from "../app/lib/agent-mail.server";
 
 const app = new Hono<{ Bindings: Env }>();
 
-// The whole agentmail.goobnut.com hostname sits behind Cloudflare Access, so
-// every call — REST or MCP — needs the service-token headers, not just the
-// app's own bearer token.
-function agentMailHeaders(env: Env, extra?: Record<string, string>) {
-	return {
-		"CF-Access-Client-Id": env.CF_ACCESS_CLIENT_ID,
-		"CF-Access-Client-Secret": env.CF_ACCESS_CLIENT_SECRET,
-		Authorization: `Bearer ${env.AGENT_MAIL_TOKEN}`,
-		...extra,
-	};
-}
+// These /api/* routes exist for external consumers / debugging via curl.
+// The app's own pages (app/routes/*.tsx) call the same helpers directly via
+// context.cloudflare.env instead of fetching these routes — a same-worker
+// subrequest to this Worker's own workers.dev URL does not loop back through
+// Hono's router and 404s.
+app.get("/api/inbox", async (c) => c.json(await fetchInbox(c.env)));
 
-// mcp-agent-mail's REST surface only covers 3 read endpoints (unified-inbox,
-// projects/{project}/agents, sibling-suggestion). Search and send only exist
-// via its MCP JSON-RPC interface at /mcp/.
-async function callAgentMailTool(env: Env, name: string, args: Record<string, unknown>) {
-	const res = await fetch(`${env.AGENT_MAIL_URL}/mcp/`, {
-		method: "POST",
-		headers: agentMailHeaders(env, { "content-type": "application/json" }),
-		body: JSON.stringify({
-			jsonrpc: "2.0",
-			id: crypto.randomUUID(),
-			method: "tools/call",
-			params: { name, arguments: args },
-		}),
-	});
+app.get("/api/projects/:project/agents", async (c) =>
+	c.json(await fetchProjectAgents(c.env, c.req.param("project"))),
+);
 
-	if (!res.ok) {
-		throw new Error(`mcp-agent-mail ${name} call failed: ${res.status}`);
-	}
-
-	const payload = (await res.json()) as {
-		error?: { message: string };
-		result?: { content?: Array<{ type: string; text?: string }> };
-	};
-
-	if (payload.error) {
-		throw new Error(payload.error.message);
-	}
-
-	const text = payload.result?.content?.[0]?.text;
-	if (!text) return payload.result ?? null;
-	try {
-		return JSON.parse(text);
-	} catch {
-		return text;
-	}
-}
-
-app.get("/api/inbox", async (c) => {
-	const res = await fetch(`${c.env.AGENT_MAIL_URL}/mail/api/unified-inbox`, {
-		headers: agentMailHeaders(c.env),
-	});
-	const body = await res.text();
-	return c.newResponse(body, res.status as any, {
-		"content-type": "application/json",
-	});
-});
-
-app.get("/api/projects/:project/agents", async (c) => {
-	const project = c.req.param("project");
-	const res = await fetch(
-		`${c.env.AGENT_MAIL_URL}/mail/api/projects/${project}/agents`,
-		{ headers: agentMailHeaders(c.env) },
-	);
-	const body = await res.text();
-	return c.newResponse(body, res.status as any, {
-		"content-type": "application/json",
-	});
-});
-
-app.get("/api/mail-projects", (c) => {
-	const projects = c.env.AGENT_MAIL_PROJECTS.split(",")
-		.map((p) => p.trim())
-		.filter(Boolean);
-	return c.json({ projects });
-});
+app.get("/api/mail-projects", (c) => c.json({ projects: listMailProjects(c.env) }));
 
 app.get("/api/search", async (c) => {
 	const project = c.req.query("project");
@@ -97,17 +30,7 @@ app.get("/api/search", async (c) => {
 	if (!project || !query) {
 		return c.json({ result: [], error: "project and query are required" }, 400);
 	}
-	try {
-		const result = await callAgentMailTool(c.env, "search_messages", {
-			project_key: project,
-			query,
-			limit: 20,
-			ranking: "recency",
-		});
-		return c.json(result);
-	} catch (err) {
-		return c.json({ result: [], error: (err as Error).message }, 502);
-	}
+	return c.json(await searchMessages(c.env, project, query));
 });
 
 app.post("/api/compose", async (c) => {
@@ -120,63 +43,13 @@ app.post("/api/compose", async (c) => {
 	}>();
 
 	if (!body.project || !body.sender || !body.to?.length || !body.subject || !body.body_md) {
-		return c.json({ error: "project, sender, to, subject, and body_md are required" }, 400);
+		return c.json({ ok: false, error: "project, sender, to, subject, and body_md are required" }, 400);
 	}
 
-	try {
-		const result = await callAgentMailTool(c.env, "send_message", {
-			project_key: body.project,
-			sender_name: body.sender,
-			to: body.to,
-			subject: body.subject,
-			body_md: body.body_md,
-		});
-		return c.json({ ok: true, result });
-	} catch (err) {
-		return c.json({ ok: false, error: (err as Error).message }, 502);
-	}
+	return c.json(await sendMessage(c.env, body));
 });
 
-app.get("/api/tasks", async (c) => {
-	const repos = c.env.GITHUB_REPOS.split(",")
-		.map((r) => r.trim())
-		.filter(Boolean);
-
-	const results = await Promise.all(
-		repos.map(async (repo) => {
-			const res = await fetch(
-				`https://api.github.com/repos/${repo}/issues?state=open&per_page=50`,
-				{
-					headers: {
-						Authorization: `Bearer ${c.env.GITHUB_TOKEN}`,
-						"User-Agent": "agent-mail-inbox-app",
-						Accept: "application/vnd.github+json",
-					},
-				},
-			);
-			if (!res.ok) return [];
-			const issues = (await res.json()) as any[];
-			return issues
-				.filter((i) => !i.pull_request)
-				.map((i) => ({
-					repo,
-					number: i.number,
-					title: i.title,
-					url: i.html_url,
-					state: i.state,
-					labels: (i.labels || []).map((l: any) =>
-						typeof l === "string" ? l : l.name,
-					),
-					created_at: i.created_at,
-					updated_at: i.updated_at,
-				}));
-		}),
-	);
-
-	return c.json({ tasks: results.flat() });
-});
-
-// Add more routes here
+app.get("/api/tasks", async (c) => c.json({ tasks: await fetchGithubTasks(c.env) }));
 
 app.get("*", (c) => {
 	const requestHandler = createRequestHandler(
